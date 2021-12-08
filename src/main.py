@@ -10,33 +10,43 @@ import operator
 import functools
 import copy
 import random
-
+import json
+import subprocess
 
 from pathlib import Path
 from time import time
 from sklearn.decomposition import PCA
+from scipy.stats import norm
 from collections import defaultdict, Counter
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
+
 def profile(f):
     def wrap(*args, **kwargs):
         fname = f.__name__
-        argnames = f.__code__.co_varnames[:f.__code__.co_argcount]
-        filled_args = ', '.join('%s=%r' % entry for entry in list(zip(argnames, args[:len(argnames)])) + [("args", list(args[len(argnames):]))] + [("kwargs", kwargs)])
+        argnames = f.__code__.co_varnames[: f.__code__.co_argcount]
+        filled_args = ", ".join(
+            "%s=%r" % entry
+            for entry in list(zip(argnames, args[: len(argnames)]))
+            + [("args", list(args[len(argnames) :]))]
+            + [("kwargs", kwargs)]
+        )
         logger.info(f"Started: {fname}({filled_args})")
         starting_time = time()
         output = f(*args, **kwargs)
         logger.info(f"Ended: {fname}, duration {time() - starting_time}s")
         return output
+
     return wrap
 
 
 def signal_kill(signal, frame):
     print("Killed!")
     sys.exit(0)
+
 
 signal.signal(signal.SIGINT, signal_kill)
 
@@ -109,9 +119,13 @@ def convert_bam(bam_path, binsize=5000, min_mapq=1):
             logging.info(f"Processing: {chrom}, filling: {n_bins} bins")
 
             fs_dict = [defaultdict(int) for __ in range(n_bins)]
-            rc_counts = np.zeros(int(bam_file.lengths[index] / float(binsize) + 1), dtype=np.int32)
+            rc_counts = np.zeros(
+                int(bam_file.lengths[index] / float(binsize) + 1), dtype=np.int32
+            )
 
-            for ((read1, read1_prevpos), (read2, read2_prevpos)) in read_pair_gen(bam_file, stats_map, chrom):
+            for ((read1, read1_prevpos), (read2, read2_prevpos)) in read_pair_gen(
+                bam_file, stats_map, chrom
+            ):
                 if read1.pos == read1_prevpos or read2.pos == read2_prevpos:
                     stats_map["reads_rmdup"] += 2
                     continue
@@ -145,21 +159,27 @@ def convert_bam(bam_path, binsize=5000, min_mapq=1):
             "pair_fail": stats_map["reads_pairf"],
         }
 
-    return {"RC" : rc_chr_map, "FS" : fs_chr_map}, qual_info
+    return {"RC": rc_chr_map, "FS": fs_chr_map}, qual_info
 
 
 @profile
 def wcr_convert(args):
     sample, qual_info = convert_bam(args.infile, args.binsize, args.map_quality)
-    np.savez_compressed(args.outfile,
-                        quality=qual_info,
-                        args={"binsize" : args.binsize,
-                              "map_quality" : args.map_quality,
-                              "infile" : args.infile,
-                              "outfile" : args.outfile},
-                        sample=sample)
+    np.savez_compressed(
+        args.outfile,
+        quality=qual_info,
+        args={
+            "binsize": args.binsize,
+            "map_quality": args.map_quality,
+            "infile": args.infile,
+            "outfile": args.outfile,
+        },
+        sample=sample,
+    )
+
 
 ########
+
 
 def scale_sample(sample, from_size, to_size, scaling_function=None):
     if scaling_function is None:
@@ -178,7 +198,9 @@ def scale_sample(sample, from_size, to_size, scaling_function=None):
     scaled_sample = dict()
     scale = to_size // from_size
 
-    logging.info(f"Scaling up by a factor of {scale} from {from_size:,} to {to_size:,}.")
+    logging.info(
+        f"Scaling up by a factor of {scale} from {from_size:,} to {to_size:,}."
+    )
 
     for chrom, data in sample.items():
         new_len = int(np.ceil(len(data) / float(scale)))
@@ -208,7 +230,7 @@ def merge_dicts(dicts, defaultdict=defaultdict, int=int):
             merged[k] += d[k]
     return merged
 
-# This also works for a list of dicts
+
 def scale_sample_counter(sample, from_size, to_size):
     return scale_sample(sample, from_size, to_size, merge_counters)
 
@@ -270,7 +292,9 @@ def freq_to_mean(sample):
         for counter in sample[key]:
             mean = 0.0
             if counter:
-                mean = sum(key * count for key, count in counter.items()) / sum(counter.values())
+                mean = sum(key * count for key, count in counter.items()) / sum(
+                    counter.values()
+                )
             new_values.append(mean)
         sample[key] = np.array(new_values)
 
@@ -293,8 +317,10 @@ def freq_to_median(sample):
 def convert(text):
     return int(text) if text.isdigit() else text.lower()
 
+
 def natural_sort(xs):
-    return sorted(xs, key=lambda key: [convert(c) for c in re.split('([0-9]+)', key)])
+    return sorted(xs, key=lambda key: [convert(c) for c in re.split("([0-9]+)", key)])
+
 
 def get_mask(samples, rc=False):
     by_chr = []
@@ -312,7 +338,7 @@ def get_mask(samples, rc=False):
 
     all_data = np.concatenate(by_chr, axis=0)
 
-    if (rc):
+    if rc:
         sum_per_sample = np.sum(all_data, 0)
         all_data = all_data / sum_per_sample
 
@@ -322,7 +348,7 @@ def get_mask(samples, rc=False):
     return mask, bins_per_chr
 
 
-def train_pca(ref_data, pcacomp=5):
+def train_pca(ref_data, pcacomp=1):
     t_data = ref_data.T
     pca = PCA(n_components=pcacomp)
     pca.fit(t_data)
@@ -354,43 +380,72 @@ def normalize_and_mask(samples, chrs, mask, rc=False):
 
     return masked_data
 
-def reference_prep(binsize, samples, mask, bins_per_chr, rc=False):
+
+def reference_prep(binsize, refsize, samples, mask, bins_per_chr, rc=False):
     bins_per_chr = bins_per_chr[:22]
-    mask = mask[:np.sum(bins_per_chr)]
+    mask = mask[: np.sum(bins_per_chr)]
 
     masked_data = normalize_and_mask(samples, range(1, 23), mask, rc)
     pca_corrected_data, pca = train_pca(masked_data)
 
-    masked_bins_per_chr = [sum(mask[sum(bins_per_chr[:i]):sum(bins_per_chr[:i]) + x]) for i, x in enumerate(bins_per_chr)]
-    masked_bins_per_chr_cum = [sum(masked_bins_per_chr[:x + 1]) for x in range(len(masked_bins_per_chr))]
+    masked_bins_per_chr = [
+        sum(mask[sum(bins_per_chr[:i]) : sum(bins_per_chr[:i]) + x])
+        for i, x in enumerate(bins_per_chr)
+    ]
+    masked_bins_per_chr_cum = [
+        sum(masked_bins_per_chr[: x + 1]) for x in range(len(masked_bins_per_chr))
+    ]
 
-    return {'binsize' : binsize,
-            'mask' : mask,
-            'masked_data' : masked_data,
-            'bins_per_chr' : bins_per_chr,
-            'masked_bins_per_chr' : masked_bins_per_chr,
-            'masked_bins_per_chr_cum' : masked_bins_per_chr_cum,
-            'pca_corrected_data' : pca_corrected_data,
-            'pca_components' : pca.components_,
-            'pca_mean' : pca.mean_}
+    return {
+        "binsize": binsize,
+        "refsize": refsize,
+        "mask": mask,
+        "masked_data": masked_data,
+        "bins_per_chr": bins_per_chr,
+        "masked_bins_per_chr": masked_bins_per_chr,
+        "masked_bins_per_chr_cum": masked_bins_per_chr_cum,
+        "pca_corrected_data": pca_corrected_data,
+        "pca_components": pca.components_,
+        "pca_mean": pca.mean_,
+    }
 
-def get_reference(pca_corrected_data, masked_bins_per_chr, masked_bins_per_chr_cum, ref_size):
+
+def get_reference(
+    pca_corrected_data, masked_bins_per_chr, masked_bins_per_chr_cum, ref_size
+):
     big_indexes = []
     big_distances = []
 
     regions = split_by_chr(0, masked_bins_per_chr_cum[-1], masked_bins_per_chr_cum)
     for (chrom, start, end) in regions:
-        chr_data = np.concatenate((pca_corrected_data[:masked_bins_per_chr_cum[chrom] - masked_bins_per_chr[chrom], :], pca_corrected_data[masked_bins_per_chr_cum[chrom]:, :]))
-        part_indexes, part_distances = get_ref_for_bins(ref_size, start, end, pca_corrected_data, chr_data)
+        chr_data = np.concatenate(
+            (
+                pca_corrected_data[
+                    : masked_bins_per_chr_cum[chrom] - masked_bins_per_chr[chrom], :
+                ],
+                pca_corrected_data[masked_bins_per_chr_cum[chrom] :, :],
+            )
+        )
+
+        part_indexes, part_distances = get_ref_for_bins(
+            ref_size, start, end, pca_corrected_data, chr_data
+        )
+
         big_indexes.extend(part_indexes)
         big_distances.extend(part_distances)
 
     index_array = np.array(big_indexes)
     distance_array = np.array(big_distances)
-    null_ratio_array = np.zeros((len(distance_array), min(len(pca_corrected_data[0]), 100)))  # TODO: make parameter
+    null_ratio_array = np.zeros(
+        (len(distance_array), min(len(pca_corrected_data[0]), 100))
+    )  # TODO: make parameter
     samples = np.transpose(pca_corrected_data)
 
-    for null_i, case_i in enumerate(random.sample(range(len(pca_corrected_data[0])), min(len(pca_corrected_data[0]), 100))):
+    for null_i, case_i in enumerate(
+        random.sample(
+            range(len(pca_corrected_data[0])), min(len(pca_corrected_data[0]), 100)
+        )
+    ):
         sample = samples[case_i]
         for bin_i in list(range(len(sample))):
             r = np.log2(sample[bin_i] / np.median(sample[index_array[bin_i]]))
@@ -403,7 +458,9 @@ def get_ref_for_bins(ref_size, start, end, pca_corrected_data, chr_data):
     ref_indexes = np.zeros((end - start, ref_size), dtype=np.int32)
     ref_distances = np.ones((end - start, ref_size))
     for cur_bin in range(start, end):
-        bin_distances = np.sum(np.power(chr_data - pca_corrected_data[cur_bin, :], 2), 1)
+        bin_distances = np.sum(
+            np.power(chr_data - pca_corrected_data[cur_bin, :], 2), 1
+        )
 
         unsrt_ranked_idx = np.argpartition(bin_distances, ref_size)[:ref_size]
         ranked_idx = unsrt_ranked_idx[np.argsort(bin_distances[unsrt_ranked_idx])]
@@ -413,6 +470,7 @@ def get_ref_for_bins(ref_size, start, end, pca_corrected_data, chr_data):
         ref_distances[cur_bin - start, :] = ranked_distances
 
     return ref_indexes, ref_distances
+
 
 def split_by_chr(start, end, chr_bin_sums):
     areas = []
@@ -430,44 +488,48 @@ def split_by_chr(start, end, chr_bin_sums):
     areas.append(tmp)
     return areas
 
+
 def reference_construct(ref_dict, ref_size=300):
-    indexes, distances, null_ratios = get_reference(ref_dict['pca_corrected_data'],
-                                                    ref_dict['masked_bins_per_chr'],
-                                                    ref_dict['masked_bins_per_chr_cum'],
-                                                    ref_size=ref_size)
-    ref_dict['indexes'] = indexes
-    ref_dict['distances'] = distances
-    ref_dict['null_ratios'] = null_ratios
+    indexes, distances, null_ratios = get_reference(
+        ref_dict["pca_corrected_data"],
+        ref_dict["masked_bins_per_chr"],
+        ref_dict["masked_bins_per_chr_cum"],
+        ref_size=ref_size,
+    )
+    ref_dict["indexes"] = indexes
+    ref_dict["distances"] = distances
+    ref_dict["null_ratios"] = null_ratios
 
 
 @profile
 def wcr_reference(args):
     split_path = list(os.path.split(args.outref))
-    if split_path[-1][-4:] == '.npz':
+    if split_path[-1][-4:] == ".npz":
         split_path[-1] = split_path[-1][:-4]
     base_path = os.path.join(split_path[0], split_path[1])
-
     args.basepath = base_path
-    args.prepfile = '{}_prep.npz'.format(base_path)
-    args.partfile = '{}_part'.format(base_path)
 
     rc_samples = []
     fs_samples = []
 
     for npz in args.in_npzs:
         logging.info(f"Loading: {npz}")
-        npzdata = np.load(npz, encoding='latin1', allow_pickle=True)
-        sample = npzdata['sample'].item()
-        sample_args = npzdata['args'].item()
-        sample_binsize = int(sample_args['binsize'])
+        npzdata = np.load(npz, encoding="latin1", allow_pickle=True)
+        sample = npzdata["sample"].item()
+        sample_args = npzdata["args"].item()
+        sample_binsize = int(sample_args["binsize"])
 
-        fs_sample = scale_sample_counter(sample['FS'], sample_binsize, args.binsize)
-        clip_sample(fs_sample, clip_lo=0, clip_hi=300) # TODO: add params
-        norm_freq_mask_sample(fs_sample, cutoff=0.0001, min_cutoff=500) # TODO: add params
+        fs_sample = scale_sample_counter(sample["FS"], sample_binsize, args.binsize)
+        clip_sample(fs_sample, clip_lo=0, clip_hi=300)  # TODO: add params
+        norm_freq_mask_sample(
+            fs_sample, cutoff=0.0001, min_cutoff=500
+        )  # TODO: add params
         freq_to_mean(fs_sample)
 
         fs_samples.append(fs_sample)
-        rc_samples.append(scale_sample_array(sample['RC'], sample_binsize, args.binsize))
+        rc_samples.append(
+            scale_sample_array(sample["RC"], sample_binsize, args.binsize)
+        )
 
     fs_samples = np.array(fs_samples)
     rc_samples = np.array(rc_samples)
@@ -475,15 +537,381 @@ def wcr_reference(args):
     fs_total_mask, fs_bins_per_chr = get_mask(fs_samples, rc=False)
     rc_total_mask, rc_bins_per_chr = get_mask(rc_samples, rc=True)
 
-    fs_auto = reference_prep(args.refsize, fs_samples, fs_total_mask, fs_bins_per_chr, rc=False)
-    rc_auto = reference_prep(args.refsize, rc_samples, rc_total_mask, rc_bins_per_chr, rc=True)
+    fs_auto = reference_prep(
+        args.binsize, args.refsize, fs_samples, fs_total_mask, fs_bins_per_chr, rc=False
+    )
+    rc_auto = reference_prep(
+        args.binsize, args.refsize, rc_samples, rc_total_mask, rc_bins_per_chr, rc=True
+    )
 
     reference_construct(fs_auto, args.refsize)
     reference_construct(rc_auto, args.refsize)
 
-    np.savez_compressed(args.outref, reference = {"RC" : rc_auto, "FS" : fs_auto})
+    np.savez_compressed(args.outref, reference={"RC": rc_auto, "FS": fs_auto})
 
 
+######
+
+
+def coverage_normalize_and_mask(sample, ref_file, rc=False):
+    by_chr = []
+    chromosomes = range(1, len(ref_file["bins_per_chr"]) + 1)
+
+    for chrom in chromosomes:
+        this_chr = np.zeros(ref_file["bins_per_chr"][chrom - 1], dtype=float)
+        min_len = min(ref_file["bins_per_chr"][chrom - 1], len(sample[str(chrom)]))
+        this_chr[:min_len] = sample[str(chrom)][:min_len]
+        by_chr.append(this_chr)
+    all_data = np.concatenate(by_chr, axis=0)
+
+    if rc:
+        all_data = all_data / np.sum(all_data)
+
+    masked_data = all_data[ref_file["mask"]]
+
+    return masked_data
+
+
+def project_pc(sample_data, ref_file):
+    pca = PCA(n_components=ref_file["pca_components"].shape[0])
+    pca.components_ = ref_file["pca_components"]
+    pca.mean_ = ref_file["pca_mean"]
+
+    transform = pca.transform(np.array([sample_data]))
+
+    reconstructed = np.dot(transform, pca.components_) + pca.mean_
+    reconstructed = reconstructed[0]
+    return sample_data / reconstructed
+
+
+def get_weights(ref_file):
+    inverse_weights = [np.mean(np.sqrt(x)) for x in ref_file["distances"]]
+    weights = np.array([1 / x for x in inverse_weights])
+    return weights
+
+
+def get_optimal_cutoff(ref_file, repeats):
+    distances = ref_file["distances"]
+    cutoff = float("inf")
+    for i in range(0, repeats):
+        mask = distances < cutoff
+        average = np.average(distances[mask])
+        stddev = np.std(distances[mask])
+        cutoff = average + 3 * stddev
+    return cutoff
+
+
+def normalize_repeat(test_data, ref_file, optimal_cutoff):
+    test_copy = np.copy(test_data)
+    for i in range(3):
+        results_z, results_r, ref_sizes = _normalize_once(
+            test_data, test_copy, ref_file, optimal_cutoff
+        )
+
+        test_copy[np.abs(results_z) >= norm.ppf(0.99)] = -1
+    m_lr = np.nanmedian(np.log2(results_r))
+    m_z = np.nanmedian(results_z)
+
+    return results_z, results_r, ref_sizes, m_lr, m_z
+
+
+def _normalize_once(test_data, test_copy, ref_file, optimal_cutoff):
+    masked_bins_per_chr = ref_file["masked_bins_per_chr"]
+    masked_bins_per_chr_cum = ref_file["masked_bins_per_chr_cum"]
+    results_z = np.zeros(masked_bins_per_chr_cum[-1])
+    results_r = np.zeros(masked_bins_per_chr_cum[-1])
+    ref_sizes = np.zeros(masked_bins_per_chr_cum[-1])
+    indexes = ref_file["indexes"]
+    distances = ref_file["distances"]
+
+    i = 0
+    i2 = 0
+    for chrom in list(range(len(masked_bins_per_chr))):
+        start = masked_bins_per_chr_cum[chrom] - masked_bins_per_chr[chrom]
+        end = masked_bins_per_chr_cum[chrom]
+        chr_data = np.concatenate(
+            (
+                test_copy[
+                    : masked_bins_per_chr_cum[chrom] - masked_bins_per_chr[chrom]
+                ],
+                test_copy[masked_bins_per_chr_cum[chrom] :],
+            )
+        )
+        for index in indexes[start:end]:
+            ref_data = chr_data[index[distances[i] < optimal_cutoff]]
+            ref_data = ref_data[ref_data >= 0]
+            ref_stdev = np.std(ref_data)
+
+            results_z[i2] = (test_data[i] - np.mean(ref_data)) / ref_stdev
+            results_r[i2] = test_data[i] / np.median(ref_data)
+            ref_sizes[i2] = ref_data.shape[0]
+            i += 1
+            i2 += 1
+
+    return results_z, results_r, ref_sizes
+
+
+def normalize(maskrepeats, sample, final_dict, rc=False):
+    sample = coverage_normalize_and_mask(sample, final_dict, rc)
+    sample = project_pc(sample, final_dict)
+    results_w = get_weights(final_dict)
+    optimal_cutoff = get_optimal_cutoff(final_dict, maskrepeats)
+    results_z, results_r, ref_sizes, m_lr, m_z = normalize_repeat(
+        sample, final_dict, optimal_cutoff
+    )
+    return results_r, results_z, results_w, ref_sizes, m_lr, m_z
+
+
+def inflate_results(results, rem_input):
+    temp = [0 for x in rem_input["mask"]]
+    j = 0
+    for i, val in enumerate(rem_input["mask"]):
+        if val:
+            temp[i] = results[j]
+            j += 1
+    return temp
+
+
+def get_post_processed_result(minrefbins, result, ref_sizes, rem_input):
+    infinite_mask = ref_sizes < minrefbins
+    result[infinite_mask] = 0
+    inflated_results = inflate_results(result, rem_input)
+
+    final_results = []
+    for chr in range(len(rem_input["bins_per_chr"])):
+        chr_data = inflated_results[
+            sum(rem_input["bins_per_chr"][:chr]) : sum(
+                rem_input["bins_per_chr"][: chr + 1]
+            )
+        ]
+        final_results.append(chr_data)
+
+    return final_results
+
+
+def log_trans(results, log_r_median):
+    for chr in range(len(results["results_r"])):
+        results["results_r"][chr] = np.log2(results["results_r"][chr])
+
+    results["results_r"] = [x.tolist() for x in results["results_r"]]
+
+    for c in range(len(results["results_r"])):
+        for i, rR in enumerate(results["results_r"][c]):
+            if not np.isfinite(rR):
+                results["results_r"][c][i] = 0
+                results["results_z"][c][i] = 0
+                results["results_w"][c][i] = 0
+            if results["results_r"][c][i] != 0:
+                results["results_r"][c][i] = results["results_r"][c][i] - log_r_median
+
+
+def _wcr_detect_wrap(sample, final_dict, rc=False):
+    # maskrepeats = 5
+    results_r, results_z, results_w, ref_sizes, m_lr, m_z = normalize(
+        5, sample, final_dict, rc=rc
+    )
+
+    null_ratios_aut_per_bin = final_dict["null_ratios"]
+
+    rem_input = {
+        "binsize": int(final_dict["binsize"]),
+        "mask": final_dict["mask"],
+        "bins_per_chr": np.array(final_dict["bins_per_chr"]),
+        "masked_bins_per_chr": np.array(final_dict["masked_bins_per_chr"]),
+        "masked_bins_per_chr_cum": np.array(final_dict["masked_bins_per_chr_cum"]),
+    }
+
+    results_z = results_z - m_z
+    results_w = results_w / np.nanmean(results_w)
+
+    if np.isnan(results_w).any() or np.isinf(results_w).any():
+        logging.warning(
+            "Non-numeric values found in weights -- reference too small. Circular binary segmentation and z-scoring will be unweighted"
+        )
+        results_w = np.ones(len(results_w))
+
+    null_ratios = np.array([x.tolist() for x in null_ratios_aut_per_bin])
+
+    results = {
+        "results_r": results_r,
+        "results_z": results_z,
+        "results_w": results_w,
+        "results_nr": null_ratios,
+        "ref_sizes": ref_sizes,
+    }
+
+    # minrefbins = 150
+    for result in results.keys():
+        results[result] = get_post_processed_result(
+            150, results[result], ref_sizes, rem_input
+        )
+
+    log_trans(results, m_lr)
+
+    return results, rem_input
+
+
+def get_res_to_nparray(results):
+    new_results = {}
+    new_results["results_z"] = np.array([np.array(x) for x in results["results_z"]])
+    new_results["results_w"] = np.array([np.array(x) for x in results["results_w"]])
+    new_results["results_nr"] = np.array([np.array(x) for x in results["results_nr"]])
+    new_results["results_r"] = np.array([np.array(x) for x in results["results_r"]])
+    return new_results
+
+
+def res_to_nestedlist(results):
+    for k, v in results.items():
+        results[k] = [list(i) for i in v]
+
+
+def get_z_score(results_c, results):
+    results_nr, results_r, results_w = (
+        results["results_nr"],
+        results["results_r"],
+        results["results_w"],
+    )
+    zs = []
+    for segment in results_c:
+        segment_nr = results_nr[segment[0]][segment[1] : segment[2]]
+        segment_rr = results_r[segment[0]][segment[1] : segment[2]]
+        segment_nr = [
+            segment_nr[i] for i in range(len(segment_nr)) if segment_rr[i] != 0
+        ]
+        segment_w = results_w[segment[0]][segment[1] : segment[2]]
+        segment_w = [segment_w[i] for i in range(len(segment_w)) if segment_rr[i] != 0]
+        null_segments = [
+            np.ma.average(x, weights=segment_w) for x in np.transpose(segment_nr)
+        ]
+        null_mean = np.ma.mean([x for x in null_segments if np.isfinite(x)])
+        null_sd = np.ma.std([x for x in null_segments if np.isfinite(x)])
+        z = (segment[3] - null_mean) / null_sd
+        z = min(z, 1000)
+        z = max(z, -1000)
+        zs.append(z)
+    return zs
+
+
+def _get_processed_cbs(cbs_data):
+    results_c = []
+    for i, segment in enumerate(cbs_data):
+        chr = int(segment["chr"]) - 1
+        s = int(segment["s"])
+        e = int(segment["e"])
+        r = segment["r"]
+        results_c.append([chr, s, e, r])
+    return results_c
+
+
+def exec_R(json_dict):
+    json.dump(json_dict, open(json_dict["infile"], "w"))
+
+    r_cmd = ["Rscript", json_dict["R_script"], "--infile", json_dict["infile"]]
+    logging.debug("CBS cmd: {}".format(r_cmd))
+
+    try:
+        subprocess.check_call(r_cmd)
+    except subprocess.CalledProcessError as e:
+        logging.critical("Rscript failed: {}".format(e))
+        sys.exit()
+
+    os.remove(json_dict["infile"])
+    if "outfile" in json_dict.keys():
+        json_out = json.load(open(json_dict["outfile"]))
+        os.remove(json_dict["outfile"])
+        return json_out
+
+
+def exec_cbs(rem_input, results):
+    json_cbs_dir = os.path.abspath("test" + "_CBS_tmp")
+
+    json_dict = {
+        "R_script": str(
+            "include/CBS.R"
+        ),
+        "ref_gender": "A",
+        "alpha": str(1e-4),
+        "binsize": str(rem_input["binsize"]),
+        "results_r": results["results_r"],
+        "results_w": results["results_w"],
+        "infile": str("{}_01.json".format(json_cbs_dir)),
+        "outfile": str("{}_02.json".format(json_cbs_dir)),
+    }
+
+    results_c = _get_processed_cbs(exec_R(json_dict))
+    segment_z = get_z_score(results_c, results)
+    results_c = [
+        results_c[i][:3] + [segment_z[i]] + [results_c[i][3]]
+        for i in range(len(results_c))
+    ]
+    return results_c
+
+
+def generate_segments(rem_input, results):
+    for segment in results["results_c"]:
+        chr_name = str(segment[0] + 1)
+        row = [
+            chr_name,
+            int(segment[1] * rem_input["binsize"] + 1),
+            int(segment[2] * rem_input["binsize"]),
+            segment[4],
+            segment[3],
+        ]
+        if float(segment[3]) > 5:
+            print("{}\tgain\n".format("\t".join([str(x) for x in row])))
+        elif float(segment[3]) < -5:
+            print("{}\tloss\n".format("\t".join([str(x) for x in row])))
+
+
+@profile
+def wcr_detect(args):
+    ref_npz = np.load(args.reference, encoding="latin1", allow_pickle=True)
+    sample_npz = np.load(args.in_npz, encoding="latin1", allow_pickle=True)
+
+    ref = ref_npz["reference"].item()
+
+    sample_args = sample_npz["args"].item()
+    sample_data = sample_npz["sample"].item()
+
+    rc_sample = sample_data["RC"]
+    fs_sample = sample_data["FS"]
+
+    rc_sample = scale_sample_array(
+        rc_sample, sample_args["binsize"], ref["RC"]["binsize"]
+    )
+
+    fs_sample = scale_sample_counter(
+        fs_sample, sample_args["binsize"], ref["FS"]["binsize"]
+    )
+    clip_sample(fs_sample, clip_lo=0, clip_hi=300)  # TODO: add params
+    norm_freq_mask_sample(fs_sample, cutoff=0.0001, min_cutoff=500)  # TODO: add params
+    freq_to_mean(fs_sample)
+
+    rc_results, rc_rem_input = _wcr_detect_wrap(rc_sample, ref["RC"], rc=True)
+    fs_results, fs_rem_input = _wcr_detect_wrap(fs_sample, ref["FS"], rc=False)
+
+    _rc_results = get_res_to_nparray(rc_results)
+    _fs_results = get_res_to_nparray(fs_results)
+
+    comb_results = {}
+    comb_results["results_z"] = (
+        _rc_results["results_z"] + (-_fs_results["results_z"])
+    ) / np.sqrt(2)
+    comb_results["results_r"] = (
+        _rc_results["results_r"] + (-_fs_results["results_r"])
+    ) / np.sqrt(2)
+    comb_results["results_w"] = (
+        _rc_results["results_w"] + (_fs_results["results_w"])
+    ) / 2
+    comb_results["results_nr"] = (
+        _rc_results["results_nr"] + (_fs_results["results_nr"])
+    ) / 2
+
+    res_to_nestedlist(comb_results)
+
+    comb_results["results_c"] = exec_cbs(fs_rem_input, comb_results)
+
+    generate_segments(fs_rem_input, comb_results)
 
 
 def make_generic(cvalue, func_xs, comp_xs, typecast, message):
@@ -517,7 +945,6 @@ def make_generic(cvalue, func_xs, comp_xs, typecast, message):
     return check_generic
 
 
-
 REGION_MIN = 5000
 REGION_MAX = 20000000
 
@@ -544,10 +971,11 @@ check_qual = make_generic(
 @profile
 def main():
     logger = logging.getLogger(__name__)
-    logging.basicConfig(format='[%(levelname)s - %(asctime)s]: %(message)s',
-                        datefmt='%Y-%m-%d %H:%M:%S')
+    logging.basicConfig(
+        format="[%(levelname)s - %(asctime)s]: %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+    )
 
-    parser = argparse.ArgumentParser(description='wisecondorFF')
+    parser = argparse.ArgumentParser(description="wisecondorFF")
     subparsers = parser.add_subparsers(dest="subcommand")
 
     parser_logger = argparse.ArgumentParser(add_help=False)
@@ -560,72 +988,172 @@ def main():
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
     )
 
-    parser_convert = subparsers.add_parser("convert",
-                                           help="Read and process a BAM file.",
-                                           parents=[parser_logger],
-                                           formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser_convert.add_argument("-i",
-                                "--in_file",
-                                dest="infile",
-                                help="Input BAM file for conversion.",
-                                type=str,
-                                required=True)
-    parser_convert.add_argument("-o",
-                                "--out_file",
-                                dest="outfile",
-                                help="Output .npz file.",
-                                type=str,
-                                required=True)
-    parser_convert.add_argument("-b",
-                                "--binsize",
-                                dest="binsize",
-                                help="Bin size (bp).",
-                                default=5e4,
-                                type=check_bins,
-                                required=False)
-    parser_convert.add_argument("-q",
-                                "--quality",
-                                dest="map_quality",
-                                help="Mapping quality.",
-                                default=1,
-                                type=check_qual,
-                                required=False)
+    parser_convert = subparsers.add_parser(
+        "convert",
+        help="Read and process a BAM file.",
+        parents=[parser_logger],
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser_convert.add_argument(
+        "-i",
+        "--in_file",
+        dest="infile",
+        help="Input BAM file for conversion.",
+        type=str,
+        required=True,
+    )
+    parser_convert.add_argument(
+        "-o",
+        "--out_file",
+        dest="outfile",
+        help="Output .npz file.",
+        type=str,
+        required=True,
+    )
+    parser_convert.add_argument(
+        "-b",
+        "--binsize",
+        dest="binsize",
+        help="Bin size (bp).",
+        default=5e4,
+        type=check_bins,
+        required=False,
+    )
+    parser_convert.add_argument(
+        "-q",
+        "--quality",
+        dest="map_quality",
+        help="Mapping quality.",
+        default=1,
+        type=check_qual,
+        required=False,
+    )
     parser_convert.set_defaults(func=wcr_convert)
 
     ####
 
-    parser_reference = subparsers.add_parser("reference",
-                                          help="Create a reference set using healthy controls",
-                                          parents=[parser_logger],
-                                          formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser_reference.add_argument("-i",
-                                  "--in_npz",
-                                  dest="in_npzs",
-                                  nargs="+",
-                                  help="Path to all NPZ files",
-                                  type=str,
-                                  required=True)
-    parser_reference.add_argument("-o",
-                                  "-out_ref",
-                                  dest="outref",
-                                  help="Path and filename for the reference output (e.g. path/to/myref.npz)",
-                                  type=str,
-                                  required=True)
-    parser_reference.add_argument("-r"
-                                  "--refsize",
-                                  dest="refsize",
-                                  help="Amount of reference regions per region",
-                                  default=300,
-                                  type=int,
-                                  required=False)
-    parser_reference.add_argument("-b"
-                                  "--binsize",
-                                  dest="binsize",
-                                  help="Scale samples to this region size, multiples of existing region size only",
-                                  default=500000,
-                                  type=int,
-                                  required=False)
+    parser_reference = subparsers.add_parser(
+        "reference",
+        help="Create a reference set using healthy controls",
+        parents=[parser_logger],
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser_reference.add_argument(
+        "-i",
+        "--in_npz",
+        dest="in_npzs",
+        nargs="+",
+        help="Path to all NPZ files",
+        type=str,
+        required=True,
+    )
+    parser_reference.add_argument(
+        "-o",
+        "-out_ref",
+        dest="outref",
+        help="Path and filename for the reference output (e.g. path/to/myref.npz)",
+        type=str,
+        required=True,
+    )
+    parser_reference.add_argument(
+        "-r",
+        "--refsize",
+        dest="refsize",
+        help="Amount of reference regions per region",
+        default=300,
+        type=int,
+        required=False,
+    )
+    parser_reference.add_argument(
+        "-b",
+        "--binsize",
+        dest="binsize",
+        help="Scale samples to this region size, multiples of existing region size only",
+        default=500000,
+        type=int,
+        required=False,
+    )
     parser_reference.set_defaults(func=wcr_reference)
+
+    ####
+
+    parser_test = subparsers.add_parser(
+        "detect",
+        help="Detect CNVs",
+        parents=[parser_logger],
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    parser_test.add_argument(
+        "-i",
+        "--in-npz",
+        dest="in_npz",
+        type=str,
+        help="Input sample npz file",
+        required=True,
+    )
+    parser_test.add_argument(
+        "-r",
+        "--reference",
+        dest="reference",
+        type=str,
+        help="Reference .npz, as previously created with newref",
+        required=True,
+    )
+    parser_test.add_argument(
+        "-o",
+        "-out-id",
+        dest="outid",
+        type=str,
+        help="Basename (w/o extension) of output files (paths are allowed, e.g. path/to/ID_1)",
+        required=True,
+    )
+    parser_test.add_argument(
+        "-mrb",
+        "--min-ref-bins",
+        dest="minrefbins",
+        type=int,
+        default=150,
+        help="Minimum amount of sensible reference bins per target bin.",
+        required=False,
+    )
+    parser_test.add_argument(
+        "-m",
+        "--maskrepeats",
+        dest="maskrepeats",
+        type=int,
+        default=5,
+        help="Regions with distances > mean + sd * 3 will be masked. Number of masking cycles.",
+        required=False,
+    )
+    parser_test.add_argument(
+        "-a",
+        "--alpha",
+        dest="alpha",
+        type=float,
+        default=1e-4,
+        help="P-value cut-off for calling a CBS breakpoint.",
+        required=False,
+    )
+    parser_test.add_argument(
+        "-z",
+        "--zscore",
+        dest="zscore",
+        type=float,
+        default=5,
+        help="Z-score cut-off for aberration calling.",
+        required=False,
+    )
+    parser_test.add_argument(
+        "-b",
+        "--beta",
+        dest="beta",
+        type=float,
+        default=None,
+        help="When beta is given, --zscore is ignored and a ratio cut-off is used to call aberrations. Beta is a number between 0 (liberal) and 1 (conservative) and is optimally close to the purity.",
+        required=False,
+    )
+    parser_test.set_defaults(func=wcr_detect)
 
     args = parser.parse_args()
 
@@ -638,5 +1166,6 @@ def main():
 
     args.func(args)
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
