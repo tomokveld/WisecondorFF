@@ -8,6 +8,7 @@ import re
 import signal
 import operator
 import functools
+import uuid
 import copy
 import random
 import json
@@ -23,6 +24,7 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+warnings.filterwarnings('ignore')
 
 def profile(f):
     def wrap(*args, **kwargs):
@@ -39,9 +41,7 @@ def profile(f):
         output = f(*args, **kwargs)
         logger.info(f"Ended: {fname}, duration {time() - starting_time}s")
         return output
-
     return wrap
-
 
 def signal_kill(signal, frame):
     print("Killed!")
@@ -206,7 +206,7 @@ def scale_sample(sample, from_size, to_size, scaling_function=None):
         new_len = int(np.ceil(len(data) / float(scale)))
         scaled_chrom = []
         for i in range(new_len):
-            scaled_chrom.append(scaling_function(data[i * scale : (i * scale) + scale]))
+            scaled_chrom.append(scaling_function(data[int(i * scale) : int((i * scale) + scale)]))
         scaled_sample[chrom] = np.array(scaled_chrom)
 
     return scaled_sample
@@ -520,16 +520,12 @@ def wcr_reference(args):
         sample_binsize = int(sample_args["binsize"])
 
         fs_sample = scale_sample_counter(sample["FS"], sample_binsize, args.binsize)
-        clip_sample(fs_sample, clip_lo=0, clip_hi=300)  # TODO: add params
-        norm_freq_mask_sample(
-            fs_sample, cutoff=0.0001, min_cutoff=500
-        )  # TODO: add params
+        clip_sample(fs_sample, clip_lo=args.fs_clip_low, clip_hi=args.fs_clip_high)
+        norm_freq_mask_sample(fs_sample, cutoff=args.rc_clip_norm, min_cutoff=args.rc_clip_abs)
         freq_to_mean(fs_sample)
 
         fs_samples.append(fs_sample)
-        rc_samples.append(
-            scale_sample_array(sample["RC"], sample_binsize, args.binsize)
-        )
+        rc_samples.append(scale_sample_array(sample["RC"], sample_binsize, args.binsize))
 
     fs_samples = np.array(fs_samples)
     rc_samples = np.array(rc_samples)
@@ -603,7 +599,7 @@ def get_optimal_cutoff(ref_file, repeats):
 
 def normalize_repeat(test_data, ref_file, optimal_cutoff):
     test_copy = np.copy(test_data)
-    for i in range(3):
+    for i in range(3): # TODO: Parameter
         results_z, results_r, ref_sizes = _normalize_once(
             test_data, test_copy, ref_file, optimal_cutoff
         )
@@ -705,16 +701,16 @@ def log_trans(results, log_r_median):
                 results["results_r"][c][i] = results["results_r"][c][i] - log_r_median
 
 
-def _wcr_detect_wrap(sample, final_dict, rc=False):
-    # maskrepeats = 5
+def _wcr_detect_wrap(sample, final_dict, rc=False, maskrepeats=5, minrefbins=150, zscore=5):
     results_r, results_z, results_w, ref_sizes, m_lr, m_z = normalize(
-        5, sample, final_dict, rc=rc
+        maskrepeats, sample, final_dict, rc=rc
     )
 
     null_ratios_aut_per_bin = final_dict["null_ratios"]
 
     rem_input = {
         "binsize": int(final_dict["binsize"]),
+        "zscore": zscore,
         "mask": final_dict["mask"],
         "bins_per_chr": np.array(final_dict["bins_per_chr"]),
         "masked_bins_per_chr": np.array(final_dict["masked_bins_per_chr"]),
@@ -740,10 +736,9 @@ def _wcr_detect_wrap(sample, final_dict, rc=False):
         "ref_sizes": ref_sizes,
     }
 
-    # minrefbins = 150
     for result in results.keys():
         results[result] = get_post_processed_result(
-            150, results[result], ref_sizes, rem_input
+            minrefbins, results[result], ref_sizes, rem_input
         )
 
     log_trans(results, m_lr)
@@ -807,12 +802,12 @@ def exec_R(json_dict):
     json.dump(json_dict, open(json_dict["infile"], "w"))
 
     r_cmd = ["Rscript", json_dict["R_script"], "--infile", json_dict["infile"]]
-    logging.debug("CBS cmd: {}".format(r_cmd))
+    logging.debug(f"CBS cmd: {r_cmd}")
 
     try:
         subprocess.check_call(r_cmd)
     except subprocess.CalledProcessError as e:
-        logging.critical("Rscript failed: {}".format(e))
+        logging.critical(f"Rscript failed: {e}")
         sys.exit()
 
     os.remove(json_dict["infile"])
@@ -823,19 +818,17 @@ def exec_R(json_dict):
 
 
 def exec_cbs(rem_input, results):
-    json_cbs_dir = os.path.abspath("test" + "_CBS_tmp")
+    json_cbs_dir = os.path.abspath('test_' + str(uuid.uuid4()) + '_CBS_tmp')
 
     json_dict = {
-        "R_script": str(
-            "include/CBS.R"
-        ),
+        "R_script": str(Path(os.path.dirname(os.path.realpath(__file__))).joinpath("include/CBS.R")),
         "ref_gender": "A",
         "alpha": str(1e-4),
         "binsize": str(rem_input["binsize"]),
         "results_r": results["results_r"],
         "results_w": results["results_w"],
-        "infile": str("{}_01.json".format(json_cbs_dir)),
-        "outfile": str("{}_02.json".format(json_cbs_dir)),
+        "infile": str(f"{json_cbs_dir}_01.json"),
+        "outfile": str(f"{json_cbs_dir}_02.json"),
     }
 
     results_c = _get_processed_cbs(exec_R(json_dict))
@@ -857,9 +850,9 @@ def generate_segments(rem_input, results):
             segment[4],
             segment[3],
         ]
-        if float(segment[3]) > 5:
+        if float(segment[3]) > rem_input["zscore"]:
             print("{}\tgain\n".format("\t".join([str(x) for x in row])))
-        elif float(segment[3]) < -5:
+        elif float(segment[3]) < -rem_input["zscore"]:
             print("{}\tloss\n".format("\t".join([str(x) for x in row])))
 
 
@@ -879,16 +872,16 @@ def wcr_detect(args):
     rc_sample = scale_sample_array(
         rc_sample, sample_args["binsize"], ref["RC"]["binsize"]
     )
-
     fs_sample = scale_sample_counter(
         fs_sample, sample_args["binsize"], ref["FS"]["binsize"]
     )
-    clip_sample(fs_sample, clip_lo=0, clip_hi=300)  # TODO: add params
-    norm_freq_mask_sample(fs_sample, cutoff=0.0001, min_cutoff=500)  # TODO: add params
+
+    clip_sample(fs_sample, clip_lo=args.fs_clip_low, clip_hi=args.fs_clip_high)
+    norm_freq_mask_sample(fs_sample, cutoff=args.rc_clip_norm, min_cutoff=args.rc_clip_abs)
     freq_to_mean(fs_sample)
 
-    rc_results, rc_rem_input = _wcr_detect_wrap(rc_sample, ref["RC"], rc=True)
-    fs_results, fs_rem_input = _wcr_detect_wrap(fs_sample, ref["FS"], rc=False)
+    rc_results, rc_rem_input = _wcr_detect_wrap(rc_sample, ref["RC"], rc=True, maskrepeats=args.maskrepeats, minrefbins=args.minrefbins, zscore=args.zscore)
+    fs_results, fs_rem_input = _wcr_detect_wrap(fs_sample, ref["FS"], rc=False, maskrepeats=args.maskrepeats, minrefbins=args.minrefbins, zscore=args.zscore)
 
     _rc_results = get_res_to_nparray(rc_results)
     _fs_results = get_res_to_nparray(fs_results)
@@ -1032,10 +1025,49 @@ def main():
 
     ####
 
+    # TODO: Clean these arguments up!
+    parser_shared_args = argparse.ArgumentParser(add_help=False)
+
+    parser_shared_args.add_argument(
+        "-cl",
+        "--fs_clip_low",
+        dest="fs_clip_low",
+        help="Lower bound for the inclusion range of the fragment size distribution",
+        type=int,
+        default=0,
+    )
+
+    parser_shared_args.add_argument(
+        "-ch",
+        "--fs_clip_high",
+        dest="fs_clip_high",
+        help="Upper bound for the inclusion range of the fragment size distribution",
+        type=int,
+        default=300,
+    )
+
+    parser_shared_args.add_argument(
+        "-cn",
+        "--rc_clip_norm",
+        dest="rc_clip_norm",
+        help="Lower bound cutoff based on the normalized read count across regions (regions that fall below this cutoff are masked)",
+        type=float,
+        default=0.0001,
+    )
+
+    parser_shared_args.add_argument(
+        "-ca",
+        "--rc_clip_abs",
+        dest="rc_clip_abs",
+        help="Lower bound cutoff based on the absolute read count across regions (regions that fall below this cutoff are masked)",
+        type=float,
+        default=500,
+    )
+
     parser_reference = subparsers.add_parser(
         "reference",
-        help="Create a reference set using healthy controls",
-        parents=[parser_logger],
+        help="Construct a reference set using healthy controls",
+        parents=[parser_logger, parser_shared_args],
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser_reference.add_argument(
@@ -1059,7 +1091,7 @@ def main():
         "-r",
         "--refsize",
         dest="refsize",
-        help="Amount of reference regions per region",
+        help="Number of reference regions per region",
         default=300,
         type=int,
         required=False,
@@ -1068,7 +1100,7 @@ def main():
         "-b",
         "--binsize",
         dest="binsize",
-        help="Scale samples to this region size, multiples of existing region size only",
+        help="Scale samples to this region size (multiples of existing region size only)",
         default=500000,
         type=int,
         required=False,
@@ -1080,7 +1112,7 @@ def main():
     parser_test = subparsers.add_parser(
         "detect",
         help="Detect CNVs",
-        parents=[parser_logger],
+        parents=[parser_logger, parser_shared_args],
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
@@ -1097,7 +1129,7 @@ def main():
         "--reference",
         dest="reference",
         type=str,
-        help="Reference .npz, as previously created with newref",
+        help="Reference .npz, as previously created with reference",
         required=True,
     )
     parser_test.add_argument(
@@ -1126,15 +1158,15 @@ def main():
         help="Regions with distances > mean + sd * 3 will be masked. Number of masking cycles.",
         required=False,
     )
-    parser_test.add_argument(
-        "-a",
-        "--alpha",
-        dest="alpha",
-        type=float,
-        default=1e-4,
-        help="P-value cut-off for calling a CBS breakpoint.",
-        required=False,
-    )
+    # parser_test.add_argument(
+    #     "-a",
+    #     "--alpha",
+    #     dest="alpha",
+    #     type=float,
+    #     default=1e-4,
+    #     help="P-value cut-off for calling a CBS breakpoint.",
+    #     required=False,
+    # )
     parser_test.add_argument(
         "-z",
         "--zscore",
@@ -1144,15 +1176,15 @@ def main():
         help="Z-score cut-off for aberration calling.",
         required=False,
     )
-    parser_test.add_argument(
-        "-b",
-        "--beta",
-        dest="beta",
-        type=float,
-        default=None,
-        help="When beta is given, --zscore is ignored and a ratio cut-off is used to call aberrations. Beta is a number between 0 (liberal) and 1 (conservative) and is optimally close to the purity.",
-        required=False,
-    )
+    # parser_test.add_argument(
+    #     "-b",
+    #     "--beta",
+    #     dest="beta",
+    #     type=float,
+    #     default=None,
+    #     help="When beta is given, --zscore is ignored and a ratio cut-off is used to call aberrations. Beta is a number between 0 (liberal) and 1 (conservative) and is optimally close to the purity.",
+    #     required=False,
+    # )
     parser_test.set_defaults(func=wcr_detect)
 
     args = parser.parse_args()
